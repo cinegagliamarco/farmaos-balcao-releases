@@ -1,0 +1,84 @@
+# Gera o instalador da casca a partir do código privado (macfarma-app), num runner Windows.
+# Mesmos passos do job "instalador Windows" de .github/workflows/balcao-escuta.yml no macfarma-app.
+# Só roda à mão (workflow_dispatch): o secret MACFARMA_DEPLOY_KEY é uma deploy key só de leitura.
+name: instalador
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit do macfarma-app (já na main)
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: artifacts/balcao-desktop
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: cinegagliamarco/macfarma-app
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.MACFARMA_DEPLOY_KEY }}
+          sparse-checkout: artifacts/balcao-desktop
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9 # v4
+        with:
+          dotnet-version: 8.0.x
+      - name: Compilar os três executáveis
+        shell: pwsh
+        run: |
+          $versions = @('casca/FarmaOSBalcao.csproj', 'vigia/FarmaOSBalcao.Vigia.csproj', 'instalador/FarmaOSBalcao.Instalador.csproj') |
+            ForEach-Object { [regex]::Match((Get-Content $_ -Raw), '<Version>([^<]+)</Version>').Groups[1].Value }
+          $setupVersion = [regex]::Match((Get-Content instalador/FarmaOSBalcao.iss -Raw), '#define AppVersion "([^"]+)"').Groups[1].Value
+          if (($versions | Select-Object -Unique).Count -ne 1 -or $versions[0] -ne $setupVersion) { throw "Versões da casca, vigia, helper e setup diferem" }
+          dotnet test instalador.Tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet test casca.Tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet test vigia.Tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet publish casca -c Release -r win-x64 -o publicar/farmaos-balcao
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet publish vigia -c Release -r win-x64 -o publicar/farmaos-balcao-vigia
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet publish instalador -c Release -r win-x64 -o publicar/farmaos-balcao-instalar
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          (Get-Item publicar/farmaos-balcao/farmaos-balcao.exe).VersionInfo | Format-List ProductVersion, FileVersion
+          (Get-Item publicar/farmaos-balcao-vigia/farmaos-balcao-vigia.exe).VersionInfo | Format-List ProductVersion
+      - name: Zip da casca
+        shell: pwsh
+        run: |
+          # Igual ao job do Linux: sem a documentação dos pacotes nem o módulo do IIS.
+          dotnet publish casca -c Release -r win-x64 -o zip/farmaos-balcao
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Remove-Item zip/farmaos-balcao/*.xml, zip/farmaos-balcao/aspnetcorev2_inprocess.dll -ErrorAction SilentlyContinue
+          Compress-Archive -Path zip/farmaos-balcao -DestinationPath publicar/farmaos-balcao.zip
+          $hash = (Get-FileHash publicar/farmaos-balcao.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  farmaos-balcao.zip" | Set-Content publicar/farmaos-balcao.zip.sha256
+      - name: Compilar Inno Setup
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) { choco install innosetup --yes --no-progress }
+          if (!(Test-Path $iscc)) { throw "ISCC.exe não encontrado" }
+          & $iscc instalador/FarmaOSBalcao.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $hash = (Get-FileHash publicar/farmaos-balcao-setup.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  farmaos-balcao-setup.exe" | Set-Content publicar/farmaos-balcao-setup.exe.sha256
+          Get-Content publicar/farmaos-balcao-setup.exe.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: farmaos-balcao-setup
+          path: |
+            artifacts/balcao-desktop/publicar/farmaos-balcao-setup.exe
+            artifacts/balcao-desktop/publicar/farmaos-balcao-setup.exe.sha256
+            artifacts/balcao-desktop/publicar/farmaos-balcao.zip
+            artifacts/balcao-desktop/publicar/farmaos-balcao.zip.sha256
+          retention-days: 7
